@@ -1,0 +1,9 @@
+{
+    "hostname": "somewhere.my.salesforce.com",
+    "username": "",
+    "password": "",
+    "token": "",
+    "objects": ["Account", "Contact"],
+    "checkLimits": true,
+    "debug": 0
+}
