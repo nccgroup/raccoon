@@ -3,6 +3,7 @@
     "username": "",
     "password": "",
     "token": "",
+    "sessionId": "",
     "objects": ["Account", "Contact"],
     "checkLimits": true,
     "debug": 0

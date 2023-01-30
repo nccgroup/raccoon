@@ -21,7 +21,7 @@ from operator import itemgetter
 #################
 ### Constants ###
 
-VERSION = '1.0'
+VERSION = '1.1'
 
 CONFIG_FILE_FORMAT = '''\
     {
@@ -29,6 +29,7 @@ CONFIG_FILE_FORMAT = '''\
         "username": "",
         "password": "",
         "token": "",
+        "sessionId": "",
         "objects": ["Account", "Contact"],
         "checkLimits": true,
         "debug": 0
@@ -104,19 +105,28 @@ def load_config(file):
             hostname = hostname.split('.')[0] + '.my.salesforce.com'
     else:
         raise ValueError("No 'hostname' parameter in config file " + file)
+    username = password = session_id = None
     if 'username' in config:
         username = config['username']
     else:
-        raise ValueError("No 'username' parameter in config file " + file)
+        username = ''
     if 'password' in config:
         password = config['password']
     else:
-        raise ValueError("No 'password' parameter in config file " + file)
+        password = ''
     # token not always required
     if 'token' in config:
         token = config['token']
     else:
         token = ''
+    if 'sessionId' in config:
+        session_id = config['sessionId']
+    else:
+        session_id = ''
+    if len(session_id) != 0 and ( len(username) != 0 or len(password) != 0 ):
+        raise ValueError("Supply either 'sessionId' or both 'username' and 'password' in config file " + file)
+    elif len(session_id) == 0 and ( len(username) == 0 or len(password) == 0 ):
+        raise ValueError("Supply either 'sessionId' or both 'username' and 'password' in config file " + file)
     if 'objects' in config:
         objects = config['objects']
     else:
@@ -134,7 +144,7 @@ def load_config(file):
             raise TypeError("Debug value should be a number")
     else:
         debug = 0
-    return (hostname, username, password, token, objects, check_limits, debug)
+    return (hostname, username, password, token, session_id, objects, check_limits, debug)
 
 def call_rest_api(rest_api_url, session_id=None):
     """Call the REST API with a supplied URL and optional authentication."""
@@ -243,6 +253,16 @@ def login(hostname, username, password, token):
         metadata_url = metadata_url_element.text
     return (session_id, metadata_url)
 
+def verify_session(rest_api_url, session_id):
+    """Check session ID works and derive username."""
+    try:
+        chatter_users_me = call_rest_api(rest_api_url + '/chatter/users/me', session_id)
+        username = chatter_users_me['username']
+    except:
+        # could also try rest_api_url + '/connect/organization', pull out userId and get username from /sobjects/User/{userId}
+        raise RaccoonError("Failed to identify user from session ID - check cookie domain is .my.salesforce.com or .cloudforce.com")
+    return username
+
 def get_api_limits(rest_api_url, session_id):
     """Get 24-hour API usage information."""
     try:
@@ -263,7 +283,7 @@ def validate_objects(rest_api_url, session_id, objects):
     validation_errors = False
     for obj in objects:
         obj_lower = obj.lower() # Salesforce API is case insensitive for object names but this will help with matching later
-        api_name = None
+        api_name = label = None
         error_reason = 'not found - check object read permissions otherwise specify using API name'
         # try to catch known gotchas early (without risking false positives)
         if '__mdt' in obj_lower:
@@ -281,20 +301,24 @@ def validate_objects(rest_api_url, session_id, objects):
                     if sobjects is None:
                         sobjects = call_rest_api(rest_api_url + '/sobjects', session_id)['sobjects'] # 'Describe Global' API call to get full list of objects
                     for sobject in sobjects:
-                        # match on label or missing '__c' suffix or missing namespace (strict as otherwise too many matches occur)
+                        # match on label, or missing '__c' suffix and/or missing namespace (no wider otherwise too many matches occur)
                         if sobject['label'].lower() == obj_lower or sobject['labelPlural'].lower() == obj_lower or (sobject['name'].lower() == obj_lower + '__c') or \
-                                (sobject['name'].lower().find('__' + obj_lower) > 0 and sobject['name'].lower().find('__' + obj_lower) + len('__' + obj) == len(sobject['name'])):  # supplied name prefixed with '__' matches only if it's the end of object name being tested (without re)
+                                (sobject['name'].lower().find('__' + obj_lower) > 0 and sobject['name'].lower().find('__' + obj_lower) + len('__' + obj) == len(sobject['name'])) or \
+                                (sobject['name'].lower().find('__' + obj_lower + '__c') > 0 and sobject['name'].lower().find('__' + obj_lower + '__c') + len('__' + obj + '__c') == len(sobject['name'])):   # only namespace is missing: object name is a perfect match (but check missing '__c' suffix)
                             if api_name is None:
                                 api_name = sobject['name']
+                                label = sobject['label']
                             else:
+                                error_reason = "more than one possible match (e.g. '" + api_name + "' vs '" + sobject['name'] + "') - specify using API name"
                                 api_name = None
-                                error_reason = 'more than one possible match (e.g. '" + api_name + "' vs '" + sobject['name'] + "') - specify using API name'
                                 break
             else: # part of try block
                 api_name = obj_props['objectDescribe']['name']
+                label = obj_props['objectDescribe']['label']
         if api_name is not None:
             print("- Found object '" + obj + "' with API name '" + api_name + "'")
-            validated_objects.append(api_name)
+            # store API name and label (friendly name) using <space> delimiter as this character is invalid for API names
+            validated_objects.append(api_name + ' ' + label)
         else:
             print("! Skipping object '" + obj + "': " + error_reason)
             # prefix name with <space> as a signal for later that the object is invalid (since this character is invalid for API names)
@@ -401,12 +425,13 @@ def main():
     if len(sys.argv) != 2 or sys.argv[1] in ['-h', '--help', '/h', '/?']:
         print("\nUsage is:\n  "+ sys.argv[0] + " <config_file>")
         print("Config file format:\n" + CONFIG_FILE_FORMAT)
+        print("\nCredentials\n  Either:\n    username, password (and token if required)\n  Or:\n    sessionId ('sid' cookie value for .my.salesforce.com or .cloudforce.com)")
         print("Account requires:\n  'API Enabled'\n  'View Setup and Configuration'\n  'Modify Metadata Through Metadata API Functions'\n  Read permission on all specified objects (or 'View All Data')")
         exit(1)
     
     # Try to load config file
     try:
-        hostname, username, password, token, objects, check_limits, debug = load_config(sys.argv[1])
+        hostname, username, password, token, session_id, objects, check_limits, debug = load_config(sys.argv[1])
     except Exception as e:
         error("Could not load config file - check that format is valid JSON", e, 1)
     
@@ -421,10 +446,14 @@ def main():
     # Login
     print("\nTarget instance: " + hostname)
     try:
-        session_id, metadata_url = login(hostname, username, password, token)
+        if len(session_id) == 0:
+            session_id, metadata_url = login(hostname, username, password, token)
+        else:
+            username = verify_session(rest_api_url, session_id)
+            metadata_url = 'https://' + hostname + '/services/Soap/m/' + API_VERSION + '/' + session_id.split('!')[0]
     except Exception as e:
         error("Could not login - check hostname, credentials and account permissions", e, debug)
-    print("- Login successful")
+    print("- Login successful as " + username)
     
     # Check API usage
     remaining_requests = None
@@ -550,10 +579,15 @@ def main():
     print("Object Sharing (ALL records for EACH object)\n" + 44*"-" + "\n")
     for obj in validated_objects:
         # check signal from validate_objects() that object is invalid
-        if ' ' in obj:
+        if obj[0] == ' ':
             print(obj[1:] + ":\n  ! WARNING: object unsupported or invalid (reason given above when 'Validating objects')\n")
             continue
-        print(obj + ":")
+        obj_split = obj.split(' ', 1)   # obj = api_name<space>label
+        obj = obj_split[0]  # only need API name now
+        if obj == obj_split[1]:
+            print(obj + ":")
+        else:
+            print(obj_split[1] + " (" + obj + "):")
         print("  Organization-wide default sharing")
         int_sharing_model, ext_sharing_model, parent_fields = get_owd_sharing(metadata_url, session_id, obj)
         # If sharing is 'Controlled By Parent' then work out effective sharing model based on parent and object
@@ -570,16 +604,21 @@ def main():
                 else:
                     reference_to = parent_fields[0].find('.//{http://soap.sforce.com/2006/04/metadata}referenceTo')
                     if reference_to is None:
-                        print("    WARNING: sharing model for '" + obj + "' currently unsupported as parent unknown")
+                        if obj == 'Quote':  # only fullName set, no referenceTo
+                            parent = 'Opportunity'
+                        else:
+                            print("    WARNING: sharing model for '" + obj + "' currently unsupported as parent unknown")
                     else:
                         parent = reference_to.text
                     # Check for setting that "allows users with at least Read access to the Master record to create, edit, or delete related Detail records"
                     writeRequiresMasterRead = parent_fields[0].find('.//{http://soap.sforce.com/2006/04/metadata}writeRequiresMasterRead')
+                    # use a clearer variable name 'read_allows_write'!
                     if writeRequiresMasterRead is None:
-                        print("    WARNING: sharing model for '" + obj + "' incomplete as 'writeRequiresMasterRead' field not found")
+                        if obj != 'Quote':  # Quote known exception - only fullName set, no writeRequiresMasterRead (effective setting is False)
+                            print("    WARNING: sharing model for '" + obj + "' incomplete as 'writeRequiresMasterRead' field not found (assuming default 'false')")
+                        read_allows_write = False
                     else:
-                        # make the variable name clearer!
-                        read_allows_write = writeRequiresMasterRead.text.lower() == 'true'
+                        read_allows_write = (writeRequiresMasterRead.text.lower() == 'true')
             if parent:
                 print("  Parent object: '" + parent + "'")
                 # It's possible we got the OWD sharing previously but storing that and checking is more trouble than refetching
